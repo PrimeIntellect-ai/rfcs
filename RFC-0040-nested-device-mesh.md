@@ -1,4 +1,4 @@
-# (Dynamic)NestedDeviceMesh
+# NestedDeviceMesh
 
 **Authors:**
 * @Jackmin801
@@ -7,32 +7,37 @@
 
 ## **Summary**
 The current abstraction for managing process groups in torch distributed is DeviceMesh, which provides a useful model for defining N-dimensional parallelisms.
-However, the current implementation has some limitations that make it unsuitable for dynamic heterogenous training workloads.
-The first limitation is that the DeviceMesh needs to be cuboid, assuming homogeneity among processes.
+However, the current implementation has some limitations that make it unsuitable for heterogenous training workloads.
+Namely that the DeviceMesh needs to be cuboid, assuming homogeneity among processes.
 This restriction limits its applicability for heterogeneous training workloads, where different devices might have varying workloads that do not map neatly onto a cuboid mesh.
-The second limitation is that the world size needs to be known at start time. This results in an inability to create dynamic training runs where groups of processes join and leave the training without restarting all the processes in the training run.
 
-To address the first limitation, we propose the introduction of a NestedDeviceMesh abstraction.
-This new abstraction allows for more flexibility by allowing nesting of DeviceMesh instances, an element of in a DeviceMesh can be a DeviceMesh, each potentially with different shapes and sizes.
+To address this limitation, we propose the introduction of a NestedDeviceMesh abstraction.
+This new abstraction allows for more flexibility by allowing nesting of DeviceMesh instances, an element of a DeviceMesh can be a DeviceMesh, each potentially with different shapes and sizes.
 This would allow users to model more complex parallelism strategies, such as those required by heterogeneous workloads.
 
-To address the second limitation, we propose the process group creation API be rewritten to support dynamic world size by periodically polling the c10d store for the current world size and recreating the nccl communicators in the case of a change.
-
 ## **Motivation**
-This proposal is motivated by the need to support dynamic mixed hardware in OpenDiLoCo.
+This proposal aims to address the growing need for efficient distributed training in [heterogeneous environments](https://arxiv.org/abs/2301.11913), particularly as deep learning models continue to scale.
+Training workloads can involve a mix of hardware types, ranging from smaller clusters with the newest GPUs to big clusters containing older GPUs.
 
-The goal of OpenDiLoCo is to reduce the network requirement of deep learning optimization by utilising an inner and outer optimization.
-Each participating worker will optimize their respective copies of the model with the inner optimization without communicating with other workers.
-The outer optimisation step which requires communication between all workers is only triggered every few hundred steps -- reducing the amount of all worker communications.
+Large-scale distributed training in heterogeneous environments faces two key challenges: [communication overhead and the straggler effect](https://www.semianalysis.com/p/multi-datacenter-training-openais).
+In multi-region setups with diverse GPU configurations, synchronization delays can significantly increase, especially when slower or less powerful GPUs hold up the entire training process.
 
-OpenDiLoCo plans to support on and off ramping of workers which requires the outer world size to be dynamic.
-It also plans to support the participation of heterogenous workers (e.g. a worker can have 8 H100 or 16 A100) in a single training run which requires the NestedDeviceMesh abstraction.
+The NestedDeviceMesh abstraction helps mitigate these issues by enabling a hierarchical structure where different submeshes handle synchronization independently.
+By assigning smaller workloads to slower GPUs and larger workloads to more powerful ones, the system reduces the impact of stragglers, ensuring that weaker devices don't slow down the entire training process.
+This design allows for efficient scaling across heterogeneous hardware, minimizing global synchronization steps and improving overall training efficiency.
+
+By implementing NestedDeviceMesh, we aim to support:
+- Optimization algorithms that reduce overall communication latency by limiting synchronization to smaller, hierarchical submeshes [[1](https://arxiv.org/abs/2407.07852), [2](https://arxiv.org/abs/2311.08105), [3](https://github.com/NousResearch/DisTrO/blob/main/A_Preliminary_Report_on_DisTrO.pdf)].
+- Better support heterogeneous hardware, allowing for flexibility in scaling across different architectures, GPU counts, and regions.
+
+This design will be particularly beneficial for multi-data center setups where inter-region latency makes frequent synchronization prohibitively expensive.
+By enabling more independent progress within submeshes and reducing the number of global synchronization steps, NestedDeviceMesh enables more efficient distributed training at scale.
+
 
 ## **Proposed Implementation**
 The NestedDeviceMesh will extend the existing DeviceMesh class, adding the capability to define a hierarchy of meshes.
 Each level of the hierarchy will represent a different mesh, with the possibility of defining different dimensions and sizes for each mesh.
 
-The implementation of NestedDeviceMesh will also support dynamic world sizes.
 Allowing processes to join and leave the mesh before the collective communication is called.
 
 ### Key Components:
@@ -71,17 +76,9 @@ submesh_group = main_mesh.get_submesh().get_group(mesh_dim="shard")
 ### Handling Edge Cases
 - Error handling for invalid mesh configurations
 
-## **Metrics**
-- **Performance parity with DeviceMesh for static training run**: The dynamic NestedDeviceMesh should have the same performance characteristics as the original DeviceMesh in the setup where the dynamic property is not utilised.
-- **Performance improvement compared to DeviceMesh for dynamic training runs**: The dynamic NestedDeviceMesh should have better performance characteristic compared to the original DeviceMesh in the setup where the dynamic property is utilised. It should be cheaper to recreate process groups than it is to restart all the workers with elastic agent.
-- **Performance improvement compared to OpenDiLoCo hivemind implementation**: The new method for orchestrating OpenDiLoCo training should have better performance than the original one which utilises hivemind.
-- **Must allow on and off ramping of processes**: It should be possible for processes to leave the outer DeviceMesh without ruining the training run. It should be possible to join the outer DeviceMesh without ruining the training run.
-
 ## **Drawbacks**
 - **Impact on UX**: The introduction of nested meshes could complicate the user experience, especially for those who have existing code bases with the old API. However, they can opt-out by default by not using the new DeviceMesh class.
-- **Maintenance Overhead**: The dynamic feature might require a change to the way torch manages process groups that is not backwards compatible, requiring two different implementation paths which increases maintenance overhead.
 - **Integration Challenges**: Ensuring compatibility with all existing and future distributed training features in PyTorch will require coordination with the torch distributed team.
-- **Implementation Costs**: The feature might take considerable effort to implement. However, we think the effort is worth the benefits. Namely that it becomes easy for process groups to be dynamically recreated and hierarchical optimizers (like OpenDiLoCo) are supported.
 
 ## **Alternatives**
 - **Multi world abstraction instead of nesting**: Another alternative is to allow the creation of separate heterogeneous process groups directly, without requiring a mesh abstraction. However, this could complicate the mental model in the future if we plan to support communication between NestedDeviceMeshes (say to support PP in the outer mesh which would currently only support DP).
@@ -102,10 +99,9 @@ Teaching NestedDeviceMesh would involve:
 Accepting this proposal would require updates to the PyTorch documentation to include the new NestedDeviceMesh class and its associated methods. Existing guides on distributed training could also be changed to use the new NestedDeviceMesh as a default if the UX is simpler or equivalent to the original DeviceMesh
 
 ## **Unresolved questions**
-- **Characteristics of dynamic process groups**: Is dynamically recreating process groups performant and fault-tolerant?
 - **API Consistency**: How can we ensure that the NestedDeviceMesh API is consistent with other PyTorch abstractions?
 - **Supported Parallelisms**: Which parallelisms should be supported on the outer mesh at time of release?
-- **Integration with Other Backends**: Will this work for none nccl backends?
+- **Backends**: Which backends should we support?
 
 ## **Resolution**
 TBD
