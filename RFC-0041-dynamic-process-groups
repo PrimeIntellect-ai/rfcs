@@ -8,15 +8,18 @@
 ## **Summary**
 The current implementation of ProcessGroups assumes a fixed rank and world size.
 This results in the need to recreate ProcessGroups on all processes when there is a failure in one process.
-Currenty torch elastic implements this through restarting all the processes in the event of a failure and loading from the last checkpoint.
+This also means that on and off ramping processes without recreating ProcessGroups is not supported.
+Currenty torch elastic implements dynamic number of nodes through restarting all the processes and loading from the last checkpoint.
 
 However, the ProcessGroup abstraction actually wraps lazily created nccl communicators.
 We could allow ProcessGroups to have dynamic world size and rank, and recreate the nccl communicators when necessary.
 This would allow nodes to retry collectives that have world size independent inputs (i.e. all-reduce) when a node in the process group fails, reducing the amount of checkpointing and restarts necessary.
+On-ramping compute could also be made more efficient by eliminating the needs to restart all processes.
+The joining process can join the process group after warmup and RDMA the current weights from the other nodes.
 
 ## **Motivation**
 - Checkpointing and restarts are a pain
-- On and off ramping
+- Support efficient on and off ramping
 
 ## **Proposed Implementation**
 
